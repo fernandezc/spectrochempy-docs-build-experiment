@@ -37,6 +37,15 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Fetch official release tags and verify pinned source
+        id: tags
+        run: |
+          expected=e116d88254092648ecd6679689b30e8b22765ed0
+          test "$(git rev-parse HEAD)" = "$expected"
+          git fetch --no-tags https://github.com/spectrochempy/spectrochempy.git 'refs/tags/spectrochempy-v*:refs/tags/spectrochempy-v*'
+          test "$(git rev-parse HEAD)" = "$expected"
+          git describe --long --tags --first-parent --match 'spectrochempy-v[0-9]*'
+
       - name: Install Python 3.13
         id: python
         uses: actions/setup-python@v7
@@ -182,6 +191,7 @@ jobs:
         if: ${{ always() }}
         env:
           CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          TAGS_OUTCOME: ${{ steps.tags.outcome }}
           PYTHON_OUTCOME: ${{ steps.python.outcome }}
           PANDOC_OUTCOME: ${{ steps.pandoc.outcome }}
           DEPENDENCIES_OUTCOME: ${{ steps.dependencies.outcome }}
@@ -195,6 +205,7 @@ jobs:
           {
             echo "Source: fernandezc/spectrochempy@e116d88254092648ecd6679689b30e8b22765ed0"
             echo "Checkout: $CHECKOUT_OUTCOME; Python: $PYTHON_OUTCOME; pandoc: $PANDOC_OUTCOME"
+            echo "Official release tags and pinned source verification: $TAGS_OUTCOME"
             echo "Documentation dependencies: $DEPENDENCIES_OUTCOME; plugins: $PLUGINS_OUTCOME; final versions: $VERSIONS_OUTCOME"
             echo "Build outcome: $BUILD_OUTCOME; inspection outcome: $INSPECT_OUTCOME"
             echo "Command exit code: ${BUILD_EXIT_CODE:-unavailable}"
