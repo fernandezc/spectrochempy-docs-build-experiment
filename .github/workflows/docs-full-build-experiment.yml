@@ -1,0 +1,213 @@
+name: Full documentation build experiment
+
+on:
+  workflow_dispatch:
+    inputs:
+      authorize_single_trial:
+        description: Independent review approved; authorize one full build without publication
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: full-documentation-experiment
+  cancel-in-progress: false
+
+jobs:
+  documentation:
+    if: ${{ inputs.authorize_single_trial && github.run_attempt == 1 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      SCPY_DOCS_TRACE: "1"
+      PIP_NO_CACHE_DIR: "1"
+    steps:
+      - name: Checkout reviewed scientific source with release tags
+        id: checkout
+        uses: actions/checkout@v7
+        with:
+          repository: fernandezc/spectrochempy
+          ref: e116d88254092648ecd6679689b30e8b22765ed0
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Python 3.13
+        id: python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install pandoc
+        id: pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes pandoc
+          pandoc --version
+
+      - name: Install documentation dependencies
+        id: dependencies
+        run: |
+          python .github/actions/verified-pip/verified_pip.py
+          python -m pip install -e ".[docs]"
+          python -m pip install "ipython==9.17.1" "jupyterlab==4.6.4" "notebook==7.6.3"
+
+      - name: Install checkout and standalone plugins
+        id: plugins
+        run: |
+          names=$(python -m spectrochempy.ci.install_plugins --list-names)
+          for name in $names; do
+            python -m pip install --no-deps -e "plugins/$name"
+          done
+          python -m pip install "spectrochempy-nmr>=0.2,<0.3" "spectrochempy-hypercomplex>=0.2,<0.3"
+          python -m pip install osqp scipy numpy-quaternion tensorly
+
+      - name: Verify final versions and record runner resources
+        id: versions
+        run: |
+          echo "READTHEDOCS_OUTPUT=$RUNNER_TEMP/full-docs-output" >> "$GITHUB_ENV"
+          git rev-parse HEAD
+          python --version
+          python -m pip freeze --all
+          python - <<'PY'
+          from importlib.metadata import version
+          from packaging.specifiers import SpecifierSet
+
+          required = {
+              "ipython": "==9.17.1",
+              "jupyterlab": "==4.6.4",
+              "notebook": "==7.6.3",
+              "spectrochempy-nmr": ">=0.2,<0.3",
+              "spectrochempy-hypercomplex": ">=0.2,<0.3",
+          }
+          for name, constraint in required.items():
+              installed = version(name)
+              print(f"{name}=={installed} (required: {constraint})")
+              if installed not in SpecifierSet(constraint):
+                  raise SystemExit(f"Unexpected final version: {name}=={installed}")
+          PY
+          nproc
+          free -h
+          df -h .
+          for file in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory.events; do
+            if [ -r "$file" ]; then cat "$file"; fi
+          done
+
+      - name: Build complete documentation and validate HTML
+        id: build
+        run: |
+          started=$(date +%s)
+          echo "started=$started" >> "$GITHUB_OUTPUT"
+          set +e
+          python -u docs/make.py html --warning-is-error -j auto
+          result=$?
+          set -e
+          echo "exit_code=$result" >> "$GITHUB_OUTPUT"
+          echo "duration_seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+          echo "Documentation command exit code: $result"
+          exit "$result"
+
+      - name: Inspect generated documentation
+        id: inspect
+        env:
+          BUILD_STARTED: ${{ steps.build.outputs.started }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime
+          from pathlib import Path
+
+          html = Path(os.environ["READTHEDOCS_OUTPUT"]) / "html"
+          required = [
+              html / "index.html",
+              html / "objects.inv",
+              html / "reference" / "index.html",
+          ]
+          for path in required:
+              if not path.is_file() or not path.stat().st_size:
+                  raise SystemExit(f"Missing or empty documentation output: {path}")
+          api = list((html / "reference" / "generated").glob("*.html"))
+          gallery = list((html / "gettingstarted" / "examples" / "gallery").rglob("plot*.html"))
+          notebooks = sorted(Path("build/~doctrees/nbsphinx").rglob("*.ipynb"))
+          executed = []
+          notebook_details = []
+          started = int(os.environ["BUILD_STARTED"])
+
+          def from_this_build(timestamp):
+              return bool(timestamp) and datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp() >= started
+
+          for path in notebooks:
+              notebook = json.loads(path.read_text())
+              code_cells = began = completed = errors = 0
+              for index, cell in enumerate(notebook.get("cells", []), start=1):
+                  if cell.get("cell_type") != "code":
+                      continue
+                  if cell.get("source"):
+                      code_cells += 1
+                  timing = cell.get("metadata", {}).get("execution", {})
+                  began += from_this_build(timing.get("iopub.status.busy"))
+                  completed += from_this_build(timing.get("iopub.status.idle"))
+                  for output in cell.get("outputs", []):
+                      if output.get("output_type") == "error":
+                          errors += 1
+                          print(f"Notebook cell error (may be intentional): {path}, cell {index}: {output.get('ename')}: {output.get('evalue')}")
+              if began:
+                  executed.append(path)
+              notebook_details.append(f"Notebook: {path}; nonempty code cells={code_cells}; started this run={began}; completed this run={completed}; error outputs={errors}")
+          if not api or len(gallery) != 46:
+              raise SystemExit(f"Unexpected output inventory: API={len(api)}, Gallery={len(gallery)}")
+          lines = [
+              f"Generated API pages: {len(api)}",
+              f"Gallery HTML pages: {len(gallery)} (execution count: see Sphinx-Gallery log summary)",
+              f"Notebooks processed by nbsphinx: {len(notebooks)} (not an execution count)",
+              f"Notebooks with cell execution timestamps from this build: {len(executed)}",
+              "HTML validation: normal docs/make.py validation completed before command exit 0.",
+          ]
+          lines.extend(f"Notebook output: {path}" for path in notebooks)
+          lines.extend(f"Notebook execution evidence: {path}" for path in executed)
+          lines.extend(notebook_details)
+          lines.append("Cell error details are in the inspection logs; allowed errors may be intentional and require manual review.")
+          print("\n".join(lines))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
+              summary.write("\n".join(f"- {line}" for line in lines) + "\n")
+          PY
+
+      - name: Final experiment report
+        if: ${{ always() }}
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          PYTHON_OUTCOME: ${{ steps.python.outcome }}
+          PANDOC_OUTCOME: ${{ steps.pandoc.outcome }}
+          DEPENDENCIES_OUTCOME: ${{ steps.dependencies.outcome }}
+          PLUGINS_OUTCOME: ${{ steps.plugins.outcome }}
+          VERSIONS_OUTCOME: ${{ steps.versions.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          INSPECT_OUTCOME: ${{ steps.inspect.outcome }}
+          BUILD_EXIT_CODE: ${{ steps.build.outputs.exit_code }}
+          BUILD_DURATION: ${{ steps.build.outputs.duration_seconds }}
+        run: |
+          {
+            echo "Source: fernandezc/spectrochempy@e116d88254092648ecd6679689b30e8b22765ed0"
+            echo "Checkout: $CHECKOUT_OUTCOME; Python: $PYTHON_OUTCOME; pandoc: $PANDOC_OUTCOME"
+            echo "Documentation dependencies: $DEPENDENCIES_OUTCOME; plugins: $PLUGINS_OUTCOME; final versions: $VERSIONS_OUTCOME"
+            echo "Build outcome: $BUILD_OUTCOME; inspection outcome: $INSPECT_OUTCOME"
+            echo "Command exit code: ${BUILD_EXIT_CODE:-unavailable}"
+            echo "Compilation duration: ${BUILD_DURATION:-unavailable} seconds"
+            echo "Step durations and total duration: native job timeline."
+            echo "Final dependency versions: Verify final versions step (pip freeze --all)."
+            echo "Gallery executions and Sphinx phases: complete build step logs."
+            echo "Processed notebook inventory does not prove execution under nbsphinx auto."
+            echo "Final verdict requires checking execution evidence; no automatic rerun."
+            echo "No publication, artifact upload or persistent cache configured."
+          } >> "$GITHUB_STEP_SUMMARY"
+          free -h
+          df -h .
+          if [ -r /sys/fs/cgroup/memory.events ]; then
+            cat /sys/fs/cgroup/memory.events
+          fi
