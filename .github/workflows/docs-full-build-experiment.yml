@@ -1,6 +1,6 @@
 name: Full documentation build experiment
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       authorize_single_trial:
